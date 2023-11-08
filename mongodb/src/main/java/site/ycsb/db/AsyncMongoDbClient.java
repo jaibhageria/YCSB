@@ -38,18 +38,26 @@ import com.allanbank.mongodb.builder.BatchedWrite;
 import com.allanbank.mongodb.builder.BatchedWriteMode;
 import com.allanbank.mongodb.builder.Find;
 import com.allanbank.mongodb.builder.Sort;
+import com.mongodb.MongoClientURI;
+import com.mongodb.ServerAddress;
+
 import site.ycsb.ByteIterator;
 import site.ycsb.DB;
 import site.ycsb.DBException;
 import site.ycsb.Status;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Random;
 import java.util.Set;
 import java.util.Vector;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * MongoDB asynchronous client for YCSB framework using the <a
@@ -107,6 +115,74 @@ public class AsyncMongoDbClient extends DB {
 
   /** The number of writes in the batchedWrite. */
   private int batchedWriteCount = 0;
+
+  // Add a list to store MongoDB server addresses
+  private List<ServerAddress> serverAddresses;
+
+  // Round-robin index to select the next server
+  private int currentIndex;
+
+  private String mongoURL;
+
+  private List<MongoClient> connectionPool;
+
+  private String rotationPolicy;
+
+  private String modifyURL(ServerAddress s) {
+    String regex = "//(.*?)/";
+    String replacement = "//" + s.getHost() + ":" + s.getPort() + "/";
+    Pattern pattern = Pattern.compile(regex);
+    Matcher matcher = pattern.matcher(mongoURL);
+    String URL = matcher.replaceAll(replacement);
+    return URL;
+  }
+
+  private void createConnectionPool() throws Exception {
+
+    for (int i=0; i<serverAddresses.size(); i++) {
+      String URL = modifyURL(serverAddresses.get(i));
+
+      MongoDbUri uri = new MongoDbUri(URL);
+      mongoClient = MongoFactory.createClient(uri);
+      connectionPool.add(mongoClient);
+
+      System.out.println("::::: mongo client connection created with " + URL);
+    }
+  }
+
+  public synchronized MongoClient getConnection() {
+        if (connectionPool.isEmpty()) {
+            throw new RuntimeException("Connection pool is empty.");
+        }
+
+        MongoClient client = connectionPool.get(currentIndex);
+
+        // Check if the connection is still active
+        try {
+          client.listDatabases();
+        } catch (Exception e) {
+            // Just reconnect
+            System.out.println("::::: attempting to reconnect to server with index " + currentIndex);
+            // client.close();
+            String URL = modifyURL(serverAddresses.get(currentIndex));
+            MongoDbUri uri = new MongoDbUri(URL);
+            client = MongoFactory.createClient(uri);;
+            connectionPool.set(currentIndex, client);
+        }
+
+        System.out.println("::::: mongo client got connection with index " + currentIndex);
+
+        // use rotation policy
+        if(rotationPolicy.equals("roundRobin")) {
+          currentIndex = (currentIndex + 1) % connectionPool.size();
+        } else if(rotationPolicy.equals("random")) {
+          Random random = new Random();
+          currentIndex = random.nextInt(connectionPool.size());
+        }
+
+        return client;
+    }
+
 
   /**
    * Cleanup any state for this DB. Called once per DB instance; there is one DB
@@ -190,11 +266,11 @@ public class AsyncMongoDbClient extends DB {
       // Just use the standard connection format URL
       // http://docs.mongodb.org/manual/reference/connection-string/
       // to configure the client.
-      String url =
+      mongoURL =
           props
               .getProperty("mongodb.url", "mongodb://localhost:27017/ycsb?w=1");
-      if (!url.startsWith("mongodb://")) {
-        System.err.println("ERROR: Invalid URL: '" + url
+      if (!mongoURL.startsWith("mongodb://")) {
+        System.err.println("ERROR: Invalid URL: '" + mongoURL
             + "'. Must be of the form "
             + "'mongodb://<host1>:<port1>,<host2>:<port2>/database?"
             + "options'. See "
@@ -202,7 +278,34 @@ public class AsyncMongoDbClient extends DB {
         System.exit(1);
       }
 
-      MongoDbUri uri = new MongoDbUri(url);
+      // Define the list of MongoDB server addresses in your cluster
+      // Format: host1:port1,host2:port2,...
+      String hosts = props.getProperty("mongodb.hosts", "localhost:27017");
+
+      serverAddresses = new ArrayList<>();
+      for (String hostPort : hosts.split(",")) {
+          String[] parts = hostPort.split(":");
+          if (parts.length == 2) {
+              String host = parts[0];
+              int port = Integer.parseInt(parts[1]);
+              serverAddresses.add(new ServerAddress(host, port));
+          } else {
+              System.err.println("Invalid host:port format: " + hostPort);
+              System.exit(1);
+          }
+      }
+
+      rotationPolicy = props.getProperty("mongodb.policy", "roundRobin");
+      if (!rotationPolicy.equals("roundRobin") &&
+          !rotationPolicy.equals("random")) {
+            System.err.println("Invalid rotation policy. Should be roundRobin or random");
+            System.exit(1);
+          } 
+
+      connectionPool = new ArrayList<>();
+      currentIndex = 0;
+
+      MongoDbUri uri = new MongoDbUri(mongoURL);
 
       try {
         databaseName = uri.getDatabase();
@@ -215,16 +318,14 @@ public class AsyncMongoDbClient extends DB {
         mongoClient = MongoFactory.createClient(uri);
 
         MongoClientConfiguration config = mongoClient.getConfig();
-        if (!url.toLowerCase().contains("locktype=")) {
+        if (!mongoURL.toLowerCase().contains("locktype=")) {
           config.setLockType(LockType.LOW_LATENCY_SPIN); // assumed...
         }
 
         readPreference = config.getDefaultReadPreference();
         writeConcern = config.getDefaultDurability();
-
-        database = mongoClient.getDatabase(databaseName);
-
-        System.out.println("mongo connection created with " + url);
+        createConnectionPool();
+        
       } catch (final Exception e1) {
         System.err
             .println("Could not initialize MongoDB connection pool for Loader: "
@@ -252,6 +353,9 @@ public class AsyncMongoDbClient extends DB {
   @Override
   public final Status insert(final String table, final String key,
       final Map<String, ByteIterator> values) {
+    // round robin rotate DB
+    mongoClient = getConnection();
+    database = mongoClient.getDatabase(databaseName);
     try {
       final MongoCollection collection = database.getCollection(table);
       final DocumentBuilder toInsert =
@@ -330,6 +434,9 @@ public class AsyncMongoDbClient extends DB {
   @Override
   public final Status read(final String table, final String key,
       final Set<String> fields, final Map<String, ByteIterator> result) {
+    // round robin rotate DB
+    mongoClient = getConnection();
+    database = mongoClient.getDatabase(databaseName);
     try {
       final MongoCollection collection = database.getCollection(table);
       final DocumentBuilder query =
@@ -391,6 +498,9 @@ public class AsyncMongoDbClient extends DB {
   public final Status scan(final String table, final String startkey,
       final int recordcount, final Set<String> fields,
       final Vector<HashMap<String, ByteIterator>> result) {
+    // round robin rotate DB
+    mongoClient = getConnection();
+    database = mongoClient.getDatabase(databaseName);
     try {
       final MongoCollection collection = database.getCollection(table);
 
@@ -451,6 +561,9 @@ public class AsyncMongoDbClient extends DB {
   @Override
   public final Status update(final String table, final String key,
       final Map<String, ByteIterator> values) {
+    // round robin rotate DB
+    mongoClient = getConnection();
+    database = mongoClient.getDatabase(databaseName);
     try {
       final MongoCollection collection = database.getCollection(table);
       final DocumentBuilder query = BuilderFactory.start().add("_id", key);

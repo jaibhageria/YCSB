@@ -27,6 +27,7 @@ package site.ycsb.db;
 import com.mongodb.MongoClient;
 import com.mongodb.MongoClientURI;
 import com.mongodb.ReadPreference;
+import com.mongodb.ServerAddress;
 import com.mongodb.WriteConcern;
 import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoCollection;
@@ -51,9 +52,11 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Random;
 import java.util.Set;
 import java.util.Vector;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.*;
 
 /**
  * MongoDB binding for YCSB framework using the MongoDB Inc. <a
@@ -108,6 +111,22 @@ public class MongoDbClient extends DB {
   /** If true then use updates with the upsert option for inserts. */
   private static boolean useUpsert;
 
+  // Add a list to store MongoDB server addresses
+  private List<ServerAddress> serverAddresses;
+
+  // Operation to Index Map
+  private Map<String, Integer> OpIndexMap;
+
+  private String mongoURL;
+
+  private List<MongoClient> connectionPool;
+
+  private String updateRotationPolicy;
+
+  private String scanRotationPolicy;
+
+  private String readRotationPolicy;
+
   /** The bulk inserts pending for the thread. */
   private final List<Document> bulkInserts = new ArrayList<Document>();
 
@@ -161,6 +180,86 @@ public class MongoDbClient extends DB {
     }
   }
 
+  private String modifyURL(ServerAddress s) {
+    String regex = "//(.*?)/";
+    String replacement = "//" + s.getHost() + ":" + s.getPort() + "/";
+    Pattern pattern = Pattern.compile(regex);
+    Matcher matcher = pattern.matcher(mongoURL);
+    String URL = matcher.replaceAll(replacement);
+    return URL;
+  }
+
+  private void createConnectionPool() throws Exception {
+    for (int i=0; i<serverAddresses.size(); i++) {
+      String URL = modifyURL(serverAddresses.get(i));
+
+      MongoClientURI uri = new MongoClientURI(URL);
+      mongoClient = new MongoClient(uri);
+      connectionPool.add(mongoClient);
+
+      // System.out.println("::::: mongo client connection created with " + URL);
+    }
+  }
+
+  public synchronized MongoClient getConnection(String op, String policy) {
+        if (connectionPool.isEmpty()) {
+            throw new RuntimeException("Connection pool is empty.");
+        }
+        int currentIndex = OpIndexMap.get(op);
+
+        MongoClient client = connectionPool.get(currentIndex);
+
+        // Check if the connection is still active
+        try {
+          client.listDatabases();
+        } catch (Exception e) {
+            // Just reconnect
+            client.close();
+            String URL = modifyURL(serverAddresses.get(currentIndex));
+            MongoClientURI uri = new MongoClientURI(URL);
+            client = new MongoClient(uri);
+            connectionPool.set(currentIndex, client);
+        }
+
+        // System.out.println("::::: mongo client got connection with currentIndex " + currentIndex + " for op " + op);
+
+        // use rotation policy
+        if(policy != null) {
+          if(policy.equals("roundRobin")) {
+            currentIndex = (currentIndex + 1) % connectionPool.size();
+          } else if(policy.equals("random")) {
+            Random random = new Random();
+            currentIndex = random.nextInt(connectionPool.size());
+          }
+          OpIndexMap.put(op, currentIndex);
+        }
+
+        return client;
+    }
+
+  private void checkPolicy(String rotationPolicy) {
+    if (rotationPolicy != null && 
+        !rotationPolicy.equals("roundRobin") &&
+        !rotationPolicy.equals("random")) {
+          System.err.println("Invalid rotation policy. Should be roundRobin or random");
+          System.exit(1);
+    } 
+  }
+
+  private void populateHosts(String hosts) {
+    for (String hostPort : hosts.split(",")) {
+        String[] parts = hostPort.split(":");
+        if (parts.length == 2) {
+            String host = parts[0];
+            int port = Integer.parseInt(parts[1]);
+            serverAddresses.add(new ServerAddress(host, port));
+        } else {
+            System.err.println("Invalid host:port format: " + hostPort);
+            System.exit(1);
+        }
+    }
+  }
+
   /**
    * Initialize any state for this DB. Called once per DB instance; there is one
    * DB instance per client thread.
@@ -185,17 +284,17 @@ public class MongoDbClient extends DB {
       // Just use the standard connection format URL
       // http://docs.mongodb.org/manual/reference/connection-string/
       // to configure the client.
-      String url = props.getProperty("mongodb.url", null);
-      boolean defaultedUrl = false;
-      if (url == null) {
-        defaultedUrl = true;
-        url = "mongodb://localhost:27017/ycsb?w=1";
+      mongoURL = props.getProperty("mongodb.url", null);
+      // boolean defaultedUrl = false;
+      if (mongoURL == null) {
+        // defaultedUrl = true;
+        mongoURL = "mongodb://localhost:27017/ycsb?w=1";
       }
 
-      url = OptionsSupport.updateUrl(url, props);
+      mongoURL = OptionsSupport.updateUrl(mongoURL, props);
 
-      if (!url.startsWith("mongodb://") && !url.startsWith("mongodb+srv://")) {
-        System.err.println("ERROR: Invalid URL: '" + url
+      if (!mongoURL.startsWith("mongodb://") && !mongoURL.startsWith("mongodb+srv://")) {
+        System.err.println("ERROR: Invalid URL: '" + mongoURL
             + "'. Must be of the form "
             + "'mongodb://<host1>:<port1>,<host2>:<port2>/database?options' "
             + "or 'mongodb+srv://<host>/database?options'. "
@@ -203,11 +302,41 @@ public class MongoDbClient extends DB {
         System.exit(1);
       }
 
+      // Define the list of MongoDB server addresses in your cluster
+      // Format: host1:port1,host2:port2,...
+      String hosts = props.getProperty("mongodb.hosts", null);
+
+      serverAddresses = new ArrayList<>();
+      if (hosts == null) {
+        String regex = "//(.*?)/";
+        Pattern pattern = Pattern.compile(regex);
+        Matcher matcher = pattern.matcher(mongoURL);
+        String hostPort = matcher.group(1);
+        populateHosts(hostPort);
+      } else {
+        populateHosts(hosts);
+      }
+
+      readRotationPolicy = props.getProperty("mongodb.policy.read", null);
+      checkPolicy(readRotationPolicy);
+      scanRotationPolicy = props.getProperty("mongodb.policy.scan", null);
+      checkPolicy(scanRotationPolicy);
+      updateRotationPolicy = props.getProperty("mongodb.policy.update", null);
+      checkPolicy(updateRotationPolicy);
+      
+
+      connectionPool = new ArrayList<>();
+      OpIndexMap = new HashMap<String, Integer>();
+      OpIndexMap.put("insert", 0);
+      OpIndexMap.put("read", 0);
+      OpIndexMap.put("update", 0);
+      OpIndexMap.put("scan", 0);
+
       try {
-        MongoClientURI uri = new MongoClientURI(url);
+        MongoClientURI uri = new MongoClientURI(mongoURL);
 
         String uriDb = uri.getDatabase();
-        if (!defaultedUrl && (uriDb != null) && !uriDb.isEmpty()
+        if ((uriDb != null) && !uriDb.isEmpty()
             && !"admin".equals(uriDb)) {
           databaseName = uriDb;
         } else {
@@ -215,17 +344,9 @@ public class MongoDbClient extends DB {
           databaseName = "ycsb";
 
         }
-
         readPreference = uri.getOptions().getReadPreference();
         writeConcern = uri.getOptions().getWriteConcern();
-
-        mongoClient = new MongoClient(uri);
-        database =
-            mongoClient.getDatabase(databaseName)
-                .withReadPreference(readPreference)
-                .withWriteConcern(writeConcern);
-
-        System.out.println("mongo client connection created with " + url);
+        createConnectionPool();
       } catch (Exception e1) {
         System.err
             .println("Could not initialize MongoDB connection pool for Loader: "
@@ -253,6 +374,9 @@ public class MongoDbClient extends DB {
   @Override
   public Status insert(String table, String key,
       Map<String, ByteIterator> values) {
+    // Insert only to primary; assuming first connection is the primary
+    mongoClient = getConnection("insert", null);
+    database = mongoClient.getDatabase(databaseName).withReadPreference(readPreference).withWriteConcern(writeConcern);
     try {
       MongoCollection<Document> collection = database.getCollection(table);
       Document toInsert = new Document("_id", key);
@@ -317,6 +441,9 @@ public class MongoDbClient extends DB {
   @Override
   public Status read(String table, String key, Set<String> fields,
       Map<String, ByteIterator> result) {
+    // choose a new connection acc to the rotation policy
+    mongoClient = getConnection("read", readRotationPolicy);
+    database = mongoClient.getDatabase(databaseName).withReadPreference(readPreference).withWriteConcern(writeConcern);
     try {
       MongoCollection<Document> collection = database.getCollection(table);
       Document query = new Document("_id", key);
@@ -365,6 +492,9 @@ public class MongoDbClient extends DB {
   public Status scan(String table, String startkey, int recordcount,
       Set<String> fields, Vector<HashMap<String, ByteIterator>> result) {
     MongoCursor<Document> cursor = null;
+    // choose a new connection acc to the rotation policy
+    mongoClient = getConnection("scan", scanRotationPolicy);
+    database = mongoClient.getDatabase(databaseName).withReadPreference(readPreference).withWriteConcern(writeConcern);
     try {
       MongoCollection<Document> collection = database.getCollection(table);
 
@@ -430,6 +560,9 @@ public class MongoDbClient extends DB {
   @Override
   public Status update(String table, String key,
       Map<String, ByteIterator> values) {
+    // choose a new connection acc to the rotation policy
+    mongoClient = getConnection("update", updateRotationPolicy);
+    database = mongoClient.getDatabase(databaseName).withReadPreference(readPreference).withWriteConcern(writeConcern);
     try {
       MongoCollection<Document> collection = database.getCollection(table);
 

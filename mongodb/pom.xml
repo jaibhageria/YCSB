@@ -40,6 +40,8 @@ LICENSE file.
       <groupId>com.allanbank</groupId>
       <artifactId>mongodb-async-driver</artifactId>
       <version>${mongodb.async.version}</version>
+      <scope>system</scope>
+      <systemPath>${project.basedir}/src/main/resources/mongodb-async-driver-2.0.1.jar</systemPath>
     </dependency>
     <dependency>
       <groupId>site.ycsb</groupId>
